@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from ragdrag import __version__
 from ragdrag.engine.phases import PHASE_METADATA
 
 
@@ -34,7 +35,10 @@ def test_table_has_contract_columns_and_only_registered_r6_techniques():
         "| Phase | Capability | Technique IDs | Impact | Maturity | Release |\n"
         "|---|---|---|---|---|---|\n"
     )
-    assert "| R6 | phase.r6 | RD-0601, RD-0603, RD-0604 | active-non-mutating | validated | 0.6.0 |\n" in text
+    assert (
+        "| R6 | phase.r6 | RD-0601, RD-0603, RD-0604 | "
+        f"active-non-mutating | validated | {__version__} |\n"
+    ) in text
     assert "RD-0602" not in text
     assert text == status_module().render_status_markdown()
 
@@ -43,14 +47,14 @@ def test_table_has_contract_columns_and_only_registered_r6_techniques():
 def test_validation_requires_a_real_declared_test_file(monkeypatch, validation_test):
     module = status_module()
     monkeypatch.setitem(PHASE_METADATA, "R6", replace(PHASE_METADATA["R6"], validation_test=validation_test))
-    assert "| active-non-mutating | implemented | 0.6.0 |" in module.render_status_markdown()
+    assert f"| active-non-mutating | implemented | {__version__} |" in module.render_status_markdown()
 
 
 @pytest.mark.parametrize("maturity", ["catalogued", "experimental", "implemented"])
 def test_renderer_does_not_promote_declared_maturity(monkeypatch, maturity):
     module = status_module()
     monkeypatch.setitem(PHASE_METADATA, "R6", replace(PHASE_METADATA["R6"], maturity=maturity))
-    assert f"| active-non-mutating | {maturity} | 0.6.0 |" in module.render_status_markdown()
+    assert f"| active-non-mutating | {maturity} | {__version__} |" in module.render_status_markdown()
 
 
 def test_write_and_check_detect_artifact_drift(tmp_path):

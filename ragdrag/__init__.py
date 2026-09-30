@@ -6,4 +6,4 @@ Implements the RAGdrag kill chain: Fingerprint, Probe, Exfiltrate, Poison, Hijac
 For authorized security testing and research only.
 """
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"

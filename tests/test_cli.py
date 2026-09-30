@@ -266,7 +266,8 @@ def test_network_options_create_scoped_profile_and_chat_state(tmp_path):
     output = tmp_path / "run.json"
     invocation, calls = invoke_with_engine([
         "scan", "-t", TARGET, "-H", "Authorization: Bearer secret",
-        "--cookie", "sid=secret", "--timeout", "7", "--no-verify-ssl",
+        "--cookie", "sid=secret", "--timeout", "7", "--max-requests", "250",
+        "--no-verify-ssl",
         "--query-field", "prompt", "--response-field", "answer",
         "--history-field", "messages", "--session-field", "conversation_id",
         "--session-id", "session-1", "-o", str(output),
@@ -278,6 +279,7 @@ def test_network_options_create_scoped_profile_and_chat_state(tmp_path):
     assert profile.headers_for(TARGET)["Cookie"] == "sid=secret"
     assert profile.headers_for("https://elsewhere.test/chat") == {}
     assert profile.budget.timeout_seconds == 7
+    assert profile.budget.max_requests == 250
     assert profile.verify_ssl is False
     assert (profile.query_field, profile.response_field, profile.history_field,
             profile.session_field, profile.session_id) == (
@@ -286,6 +288,15 @@ def test_network_options_create_scoped_profile_and_chat_state(tmp_path):
         "messages", "conversation_id", "session-1")
     assert json.loads(output.read_text())["schema_version"] == "1.0"
     assert "secret" not in invocation.output
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "many"])
+def test_invalid_max_requests_fails_before_engine(value):
+    invocation, calls = invoke_with_engine([
+        "scan", "-t", TARGET, "--max-requests", value,
+    ])
+    assert invocation.exit_code == 3
+    assert calls == []
 
 
 @pytest.mark.parametrize("field_name", ["input-text", "answer.text", "résultat", "input text"])

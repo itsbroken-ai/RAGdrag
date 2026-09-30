@@ -33,16 +33,22 @@ jobs:
           import tarfile
           import zipfile
 
+          from ragdrag import __version__
+
           required = {
               "ragdrag/reporters/schemas/report-v1.schema.json",
               "ragdrag/py.typed",
               *(str(path) for path in Path("ragdrag/payloads").rglob("*.json")),
           }
-          with zipfile.ZipFile("dist/ragdrag-0.6.0-py3-none-any.whl") as wheel:
+          wheel_path = Path(f"dist/ragdrag-{__version__}-py3-none-any.whl")
+          source_path = Path(f"dist/ragdrag-{__version__}.tar.gz")
+
+          with zipfile.ZipFile(wheel_path) as wheel:
               assert required <= set(wheel.namelist())
-          with tarfile.open("dist/ragdrag-0.6.0.tar.gz") as source:
+          with tarfile.open(source_path) as source:
               required_source = required | {"CHANGELOG.md", "docs/implementation-status.md"}
-              assert {"ragdrag-0.6.0/" + path for path in required_source} <= set(source.getnames())
+              prefix = f"ragdrag-{__version__}/"
+              assert {prefix + path for path in required_source} <= set(source.getnames())
           PY
       - name: Install wheel into a clean environment and smoke-test CLI
         run: |

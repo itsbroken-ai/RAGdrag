@@ -213,7 +213,7 @@ def _validate_write_request(
 
 def _execute_phases(
     *, target: str, phases: list[str], output: str | None, header: tuple[str, ...],
-    cookie: str | None, timeout: float, no_verify_ssl: bool, query_field: str,
+    cookie: str | None, timeout: float, max_requests: int, no_verify_ssl: bool, query_field: str,
     response_field: str | None, history_field: str | None, session_field: str | None,
     session_id: str | None, cleanup_url: str | None,
     established_control: tuple[str, ...], allow_write: bool,
@@ -267,7 +267,7 @@ def _execute_phases(
             history_field=history_field, session_field=session_field,
             session_id=session_id, verify_ssl=not no_verify_ssl,
             impact_ceiling=ImpactLevel.MUTATING if allow_write else ImpactLevel.ACTIVE,
-            budget=RequestBudget(timeout_seconds=timeout),
+            budget=RequestBudget(max_requests=max_requests, timeout_seconds=timeout),
         )
         options = PhaseOptions(
             query_field=query_field, response_field=response_field,
@@ -324,6 +324,8 @@ def _network_options(function):
         click.option("--session-id", default=None, help="Explicit chat session ID."),
         click.option("--output", "-o", default=None, help="Output file path for JSON report."),
         click.option("--timeout", type=float, default=30.0, help="HTTP request timeout in seconds."),
+        click.option("--max-requests", type=click.IntRange(1, 10_000), default=100,
+                     show_default=True, help="Maximum requests allowed for this run."),
         click.option("--header", "-H", "header", multiple=True,
                      help="Extra origin-scoped request header 'Key: Value' (repeatable)."),
         click.option("--cookie", default=None, help="Origin-scoped Cookie header value."),

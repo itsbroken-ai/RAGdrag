@@ -3,7 +3,7 @@
 <p align="center">
 <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
 <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
-<img src="https://img.shields.io/badge/version-0.6.0-orange.svg" alt="Version 0.6.0">
+<img src="https://img.shields.io/badge/version-0.6.1-orange.svg" alt="Version 0.6.1">
 </p>
 
 RAG pipeline security assessment toolkit for authorized testing.
@@ -88,6 +88,9 @@ Network commands share `--query-field` (default `query`), `--response-field`,
 `--history-field`, `--session-field`, and `--session-id`. A configured response
 field must contain a JSON string; malformed or missing data produces an
 `unsupported-response` outcome. Without a response field, response text is used.
+
+Each run defaults to a 100-request safety budget. Use `--max-requests` to set a
+higher explicit ceiling for authorized multi-phase assessments that need it.
 
 Use `--history-field messages` for a target that accepts conversation messages,
 or `--session-field session_id --session-id lab-session` for an explicit session.

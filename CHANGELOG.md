@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.6.1 - Full-Chain Budget Control (2026-09-30)
+
+### Added
+
+- `--max-requests` on every network command, with a conservative default of 100
+  and an explicit validated ceiling for authorized full-chain assessments.
+
 ## v0.6.0 - Trust Foundation (2026-09-30)
 
 ### Breaking safety semantics
