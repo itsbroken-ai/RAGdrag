@@ -19,8 +19,15 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
+from math import isfinite
 
 import httpx
+
+from ragdrag.adapters.chat import extract_response_text
+from ragdrag.engine.models import EvidenceState
+from ragdrag.engine.profile import canonical_origin
+from ragdrag.engine.transport import HTTPClient
 
 logger = logging.getLogger(__name__)
 
@@ -212,21 +219,13 @@ def _time_queries(
         try:
             resp = client.post(target, json={query_field: query})
             elapsed = measure_elapsed(start)
-            response_text = ""
-            if response_field and resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    response_text = data.get(response_field, "") if isinstance(data, dict) else resp.text
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    response_text = resp.text
-            else:
-                response_text = resp.text
+            response_text = extract_response_text(resp, response_field)
             stats.add(TimingResult(
                 url=target,
                 query=query,
                 elapsed_ms=elapsed,
                 status_code=resp.status_code,
-                response_text=str(response_text),
+                response_text=response_text,
             ))
         except httpx.HTTPError as e:
             logger.warning("RD-0101 timing probe failed: %s", e)
@@ -281,6 +280,228 @@ VECTOR_DB_ENDPOINTS = [
     # Pinecone (cloud-hosted, check via headers)
     {"path": "/describe_index_stats", "port": 443, "db": "pinecone", "type": "api"},
 ]
+
+
+@dataclass
+class _HtmlFrame:
+    tag: str
+    hidden: bool
+    document_title: bool = False
+    broken: bool = False
+    text: list[str] = field(default_factory=list)
+
+
+class _DashboardBrandingParser(HTMLParser):
+    """Match one visible product label inside a single HTML document element."""
+
+    _VOID = frozenset({"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"})
+    _INLINE = frozenset({"b", "em", "i", "mark", "small", "span", "strong"})
+    _IGNORED = frozenset({"script", "style", "template", "svg"})
+    _HEADINGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
+    _LABELS = frozenset({"qdrant", "qdrant dashboard"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.has_html_root = False
+        self.root_closed = False
+        self.matches = False
+        self.frames: list[_HtmlFrame] = []
+        self.seen_head = False
+        self.seen_title = False
+        self.seen_body = False
+        self.malformed = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.root_closed:
+            return
+        if tag in self._VOID:
+            for frame in self.frames:
+                if frame.tag in {"html", "body", "title", "h1", "h2"}:
+                    frame.broken = True
+            return
+        if not self.has_html_root:
+            if tag != "html":
+                return
+            self.has_html_root = True
+        elif not self.frames or tag == "html":
+            return
+
+        for frame in self.frames:
+            if frame.tag in {"html", "body", "title", "h1", "h2"} and tag not in self._INLINE:
+                frame.broken = True
+        if tag in self._HEADINGS and any(frame.tag in self._HEADINGS for frame in self.frames):
+            self.malformed = True
+
+        names = [name for name, _ in attrs]
+        if any(names.count(name) > 1 for name in ("hidden", "aria-hidden", "style")):
+            self.malformed = True
+        attributes = dict(attrs)
+        style = (attributes.get("style") or "").lower()
+        hidden = (
+            (self.frames[-1].hidden if self.frames else False)
+            or "hidden" in attributes
+            or (attributes.get("aria-hidden") or "").strip().lower() == "true"
+            or bool(re.search(r"(?:^|;)\s*display\s*:\s*none\b", style))
+            or bool(re.search(r"(?:^|;)\s*visibility\s*:\s*hidden\b", style))
+        )
+        parent_tags = [frame.tag for frame in self.frames]
+        if tag == "head":
+            if self.seen_head or self.seen_body or parent_tags != ["html"]:
+                self.malformed = True
+            self.seen_head = True
+        elif tag == "body":
+            self.seen_body = True
+        document_title = tag == "title" and parent_tags == ["html", "head"] and not self.seen_title
+        if document_title:
+            self.seen_title = True
+        self.frames.append(_HtmlFrame(
+            tag=tag,
+            hidden=hidden,
+            document_title=document_title,
+        ))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._VOID:
+            self.handle_starttag(tag, attrs)
+        else:
+            self.malformed = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.root_closed:
+            return
+        # A cross-level heading close is still a boundary, even without an
+        # exact frame match. Reject it before later text can qualify a label.
+        if tag in self._HEADINGS and any(
+            frame.tag in self._HEADINGS and frame.tag != tag for frame in self.frames
+        ):
+            self.malformed = True
+        matches = [index for index, frame in enumerate(self.frames) if frame.tag == tag]
+        if not matches:
+            return
+        match_index = matches[-1]
+        while len(self.frames) > match_index:
+            frame = self.frames.pop()
+            label = " ".join("".join(frame.text).casefold().split())
+            if not frame.hidden and not frame.broken and not any(parent.tag in self._IGNORED for parent in self.frames):
+                if frame.document_title and label in self._LABELS:
+                    self.matches = True
+                elif frame.tag in {"h1", "h2"} and any(parent.tag == "body" for parent in self.frames) and label in self._LABELS:
+                    self.matches = True
+                elif frame.tag in {"html", "body"} and label == "qdrant dashboard":
+                    self.matches = True
+            if frame.tag == "html":
+                self.root_closed = True
+
+    def handle_data(self, data: str) -> None:
+        if not self.frames or self.frames[-1].hidden:
+            return
+        tags = [frame.tag for frame in self.frames]
+        if any(tag in self._IGNORED for tag in tags):
+            return
+        for index, frame in enumerate(self.frames):
+            if frame.tag in {"title", "h1", "h2"}:
+                frame.text.append(data)
+            elif frame.tag in {"html", "body"} and all(
+                descendant in self._INLINE for descendant in tags[index + 1:]
+            ):
+                frame.text.append(data)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"nonstandard JSON constant: {value}")
+
+
+def _matches_endpoint_signature(endpoint: dict[str, object], response: httpx.Response) -> bool:
+    """Accept a service response only when its body identifies the expected API."""
+    if not 200 <= response.status_code < 300:
+        return False
+    try:
+        payload = json.loads(response.content, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+
+    db = endpoint["db"]
+    path = endpoint["path"]
+    if db == "chromadb" and path == "/api/v1/heartbeat":
+        heartbeat = payload.get("nanosecond heartbeat") if isinstance(payload, dict) else None
+        return type(heartbeat) is int or (type(heartbeat) is float and isfinite(heartbeat))
+    if db == "chromadb" and path == "/api/v1/collections":
+        return isinstance(payload, list) or (
+            isinstance(payload, dict) and isinstance(payload.get("collections"), list)
+        )
+    if db == "qdrant" and path == "/collections":
+        return (
+            isinstance(payload, dict)
+            and payload.get("status") == "ok"
+            and isinstance(payload.get("result"), dict)
+            and isinstance(payload["result"].get("collections"), list)
+        )
+    if db == "qdrant" and path == "/telemetry":
+        result = payload.get("result") if isinstance(payload, dict) else None
+        return isinstance(result, dict) and bool({"app", "collections"}.intersection(result))
+    if db == "qdrant" and path == "/dashboard":
+        html = response.text
+        if "application/json" in response.headers.get("content-type", "").lower():
+            return False
+        if not re.match(r"\s*(?:<!doctype\s+html\s*>\s*)?<html\b", html, re.IGNORECASE):
+            return False
+        branding = _DashboardBrandingParser()
+        branding.feed(html)
+        return branding.has_html_root and not branding.malformed and branding.matches
+    if db == "weaviate" and path == "/v1/meta":
+        return (
+            isinstance(payload, dict)
+            and isinstance(payload.get("version"), str)
+            and bool({"modules", "hostname", "grpcMaxMessageSize"}.intersection(payload))
+        )
+    if db == "weaviate" and path == "/v1/schema":
+        return isinstance(payload, dict) and isinstance(payload.get("classes"), list)
+    if db == "weaviate" and path == "/v1/.well-known/ready":
+        return response.text.strip().lower() in {"true", "ready", "ok"}
+    if db == "milvus" and path == "/api/v1/health":
+        return (
+            isinstance(payload, dict)
+            and type(payload.get("code")) is int
+            and payload["code"] == 0
+            and bool({"message", "data"}.intersection(payload))
+        )
+    if db == "milvus" and path == "/v2/vectordb/collections/list":
+        data = payload.get("data") if isinstance(payload, dict) else None
+        return (
+            isinstance(payload, dict)
+            and type(payload.get("code")) is int
+            and payload["code"] == 0
+            and isinstance(data, dict)
+            and any(isinstance(data.get(key), list) for key in ("collectionNames", "collections"))
+        )
+    if db == "pinecone" and path == "/describe_index_stats":
+        latency = response.headers.get("x-pinecone-request-latency-ms")
+        if latency is not None:
+            try:
+                value = float(latency)
+            except ValueError:
+                pass
+            else:
+                if isfinite(value) and value >= 0:
+                    return True
+        if not isinstance(payload, dict):
+            return False
+        dimension = payload.get("dimension")
+        fullness = payload.get("indexFullness")
+        namespaces = payload.get("namespaces")
+        return (
+            (type(dimension) is int and dimension > 0)
+            or (
+                type(fullness) in (int, float)
+                and 0 <= fullness <= 1
+                and (type(fullness) is int or isfinite(fullness))
+            )
+            or (
+                isinstance(namespaces, dict)
+                and all(isinstance(name, str) and isinstance(info, dict) for name, info in namespaces.items())
+            )
+        )
+    return False
 
 # Error message patterns that reveal vector DB technology
 ERROR_SIGNATURES: dict[str, list[str]] = {
@@ -338,7 +559,7 @@ ERROR_PROBES = [
 
 def fingerprint_vector_db(
     target: str,
-    client: httpx.Client,
+    client: HTTPClient,
     query_field: str = "query",
     scan_ports: bool = True,
 ) -> list[Finding]:
@@ -418,7 +639,7 @@ def _probe_error_messages(
 
 def _scan_endpoints(
     target: str,
-    client: httpx.Client,
+    client: HTTPClient,
     scan_ports: bool,
 ) -> list[Finding]:
     """Scan for exposed vector DB endpoints and admin panels."""
@@ -429,21 +650,23 @@ def _scan_endpoints(
     base_host = parsed.hostname or "localhost"
     scheme = parsed.scheme or "http"
 
-    seen_ports: set[int] = set()
     if scan_ports:
         for ep in VECTOR_DB_ENDPOINTS:
             port = ep["port"]
-            if port in seen_ports:
-                continue
-            seen_ports.add(port)
-
             url = f"{scheme}://{base_host}:{port}{ep['path']}"
+            # A Pinecone cloud origin must be approved explicitly; a chat host
+            # with port 443 is not itself evidence of a Pinecone deployment.
+            if ep["db"] == "pinecone":
+                approved = getattr(getattr(client, "profile", None), "approved_origins", ())
+                origin = canonical_origin(url)
+                if origin == canonical_origin(target) or origin not in approved:
+                    continue
             try:
                 # Port scans SHOULD fail fast so a slow host doesn't stall the whole
                 # sweep; but we cap it at min(user_timeout, 5s) instead of overriding.
                 scan_timeout = min(client.timeout.connect or 5.0, 5.0) if client.timeout else 5.0
-                resp = client.get(url, timeout=scan_timeout)
-                if resp.status_code < 500:
+                resp = client.get(url, timeout=scan_timeout, follow_redirects=False)
+                if _matches_endpoint_signature(ep, resp):
                     ep_type = ep["type"]
                     confidence = "high" if ep_type == "admin_panel" else "medium"
                     findings.append(Finding(
@@ -459,7 +682,9 @@ def _scan_endpoints(
                             "url": url,
                             "status_code": resp.status_code,
                             "endpoint_type": ep_type,
+                            "proof": f"{ep['db']}:{ep['path']}",
                         },
+                        evidence_state=EvidenceState.OBSERVED,
                     ))
             except (httpx.HTTPError, httpx.ConnectError):
                 continue
@@ -507,15 +732,7 @@ def detect_knowledge_freshness(
     for query in freshness_queries:
         try:
             resp = client.post(target, json={query_field: query})
-            text = ""
-            if response_field and resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    text = str(data.get(response_field, "")) if isinstance(data, dict) else resp.text
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    text = resp.text
-            else:
-                text = resp.text
+            text = extract_response_text(resp, response_field)
 
             for pattern in freshness_indicators:
                 if re.search(pattern, text, re.IGNORECASE):

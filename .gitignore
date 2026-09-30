@@ -8,6 +8,7 @@ build/
 .eggs/
 .pytest_cache/
 .venv/
+.worktrees/
 venv/
 env/
 *.log

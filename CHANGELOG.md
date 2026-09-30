@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.6.0 - Trust Foundation (2026-09-30)
+
+### Breaking safety semantics
+
+- Default `scan` selects R1,R2,R3 at an active-non-mutating ceiling. R6 is opt-in;
+  R4/R5 in `scan` require `--allow-write`.
+- R4/R5 require a safe cleanup DELETE URL ending in `/{id}` and explicitly
+  established baseline, negative-control, and cleanup-verification controls.
+  Standalone `poison`/`hijack` retain write intent but require the same controls.
+- Existing command names and options remain compatible. Scripts relying on all
+  six default phases or untracked writes must adopt explicit safety inputs.
+
+### Added
+
+- Typed capabilities, origin-bound transport, request/response budgets,
+  evidence states, and a mutation ledger with cleanup on failure/interruption.
+- Schema 1.0 reports and exit codes 0–5 for findings, partial assessments, and
+  unresolved cleanup. Default reports redact credentials and raw extraction.
+- Explicit chat history/session flags and scoped usable-cookie state.
+- Loopback listener default, public-bind acknowledgment, body/worker bounds,
+  escaped terminal output, and owner-only raw-capture opt-in.
+- Generated capability status from executable metadata, with drift checks.
+- Python 3.10/3.11/3.12 CI gates, wheel/sdist builds, and clean-install checks;
+  packages include report schema, payload JSON, and `py.typed`.
+
+### Limits
+
+- DELETE 202 establishes acceptance, not eventual absence, even though the
+  current handler records it as `removed`. Generic POST upsert safety is not
+  proven without create-only or restore semantics.
+- Listener bounds cover body bytes and worker count; they do not establish
+  absolute connection lifetime, slow header/body progress deadlines, TLS
+  handshake deadlines, or daemon-worker completion on shutdown.
+- Registry maturity and local tests do not certify arbitrary target findings.
+  Catalogued taxonomy entries are not implementation claims.
+
 ## v0.5.0 - Full Kill Chain (2026-04-01)
 
 ### Added

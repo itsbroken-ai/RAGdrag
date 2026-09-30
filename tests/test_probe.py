@@ -9,6 +9,7 @@ import httpx
 import pytest
 import respx
 
+from ragdrag.adapters.chat import ChatResponseError
 from ragdrag.core.models import Finding
 from ragdrag.core.probe import (
     ProbeResult,
@@ -24,6 +25,7 @@ from ragdrag.core.probe import (
     run_probe,
     scan_debug_endpoints,
 )
+from ragdrag.engine.models import OutcomeCode
 
 TARGET = "http://testrag.local/chat"
 
@@ -588,12 +590,14 @@ class TestExtractResponseText:
         text = _extract_response_text(resp, None)
         assert text == "raw text here"
 
-    def test_missing_field_returns_empty(self):
+    def test_missing_field_is_unsupported_response(self):
         resp = httpx.Response(200, json={"answer": "hello"})
-        text = _extract_response_text(resp, "nonexistent")
-        assert text == ""
+        with pytest.raises(ChatResponseError) as error:
+            _extract_response_text(resp, "nonexistent")
+        assert error.value.outcome is OutcomeCode.UNSUPPORTED_RESPONSE
 
-    def test_non_200_returns_text(self):
+    def test_non_200_with_configured_field_is_unsupported_response(self):
         resp = httpx.Response(500, text="Internal Server Error")
-        text = _extract_response_text(resp, "answer")
-        assert text == "Internal Server Error"
+        with pytest.raises(ChatResponseError) as error:
+            _extract_response_text(resp, "answer")
+        assert error.value.outcome is OutcomeCode.UNSUPPORTED_RESPONSE

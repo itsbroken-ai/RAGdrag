@@ -1,0 +1,57 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev]'
+      - run: pytest -q
+      - name: Check and regenerate capability status
+        run: |
+          python -m ragdrag.engine.status --check docs/implementation-status.md
+          python -m ragdrag.engine.status --write docs/implementation-status.md
+          git diff --exit-code -- docs/implementation-status.md
+      - run: python -m build
+      - name: Inspect wheel and source distribution data
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          required = {
+              "ragdrag/reporters/schemas/report-v1.schema.json",
+              "ragdrag/py.typed",
+              *(str(path) for path in Path("ragdrag/payloads").rglob("*.json")),
+          }
+          with zipfile.ZipFile("dist/ragdrag-0.6.0-py3-none-any.whl") as wheel:
+              assert required <= set(wheel.namelist())
+          with tarfile.open("dist/ragdrag-0.6.0.tar.gz") as source:
+              required_source = required | {"CHANGELOG.md", "docs/implementation-status.md"}
+              assert {"ragdrag-0.6.0/" + path for path in required_source} <= set(source.getnames())
+          PY
+      - name: Install wheel into a clean environment and smoke-test CLI
+        run: |
+          python -m venv "$RUNNER_TEMP/ragdrag-release"
+          "$RUNNER_TEMP/ragdrag-release/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/ragdrag-release/bin/ragdrag" --version
+          "$RUNNER_TEMP/ragdrag-release/bin/ragdrag" --help
+          "$RUNNER_TEMP/ragdrag-release/bin/ragdrag" scan --help
+          "$RUNNER_TEMP/ragdrag-release/bin/ragdrag" poison --help
+          "$RUNNER_TEMP/ragdrag-release/bin/ragdrag" listen --help
+          "$RUNNER_TEMP/ragdrag-release/bin/python" -m pip check

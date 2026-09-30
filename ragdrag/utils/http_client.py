@@ -5,6 +5,9 @@ from __future__ import annotations
 import httpx
 
 from ragdrag import __version__
+from ragdrag.engine.models import RequestBudget
+from ragdrag.engine.profile import TargetProfile
+from ragdrag.engine.transport import OriginBoundClient
 
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_HEADERS = {
@@ -16,17 +19,23 @@ def build_client(
     timeout: float = DEFAULT_TIMEOUT,
     headers: dict[str, str] | None = None,
     verify_ssl: bool = True,
-) -> httpx.Client:
-    """Build a configured httpx client."""
-    merged_headers = {**DEFAULT_HEADERS}
-    if headers:
-        merged_headers.update(headers)
-    return httpx.Client(
-        timeout=timeout,
-        headers=merged_headers,
-        verify=verify_ssl,
-        follow_redirects=True,
+    *,
+    target: str | None = None,
+    cookie: str | None = None,
+) -> OriginBoundClient:
+    """Build a bounded client with any supplied credentials bound to target."""
+    if target is None:
+        if headers or cookie:
+            raise ValueError("target is required when scoped headers or cookies are supplied")
+        target = "http://localhost"
+    profile = TargetProfile.from_cli(
+        target,
+        headers=headers,
+        cookie=cookie,
+        verify_ssl=verify_ssl,
+        budget=RequestBudget(timeout_seconds=timeout),
     )
+    return OriginBoundClient(profile)
 
 
 def build_async_client(
@@ -34,13 +43,12 @@ def build_async_client(
     headers: dict[str, str] | None = None,
     verify_ssl: bool = True,
 ) -> httpx.AsyncClient:
-    """Build a configured async httpx client."""
-    merged_headers = {**DEFAULT_HEADERS}
+    """Deprecated: build a legacy async client for uncredentialed requests."""
     if headers:
-        merged_headers.update(headers)
+        raise ValueError("unscoped headers are unsupported by the deprecated async builder")
     return httpx.AsyncClient(
         timeout=timeout,
-        headers=merged_headers,
+        headers=DEFAULT_HEADERS,
         verify=verify_ssl,
         follow_redirects=True,
     )

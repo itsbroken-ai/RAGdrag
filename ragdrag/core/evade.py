@@ -22,7 +22,15 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from ragdrag.adapters.chat import (
+    ChatAdapter,
+    ChatConfig,
+    ConversationState,
+    extract_response_text,
+)
 from ragdrag.core.models import Finding
+from ragdrag.core.poison import CleanupStrategy
+from ragdrag.engine.mutations import MutationLedger
 
 logger = logging.getLogger(__name__)
 
@@ -172,10 +180,7 @@ def assess_substitution_bypass(
         # Send direct query
         try:
             direct_resp = client.post(target, json={query_field: direct})
-            direct_text = (
-                direct_resp.text if response_field is None
-                else str(direct_resp.json().get(response_field, ""))
-            )
+            direct_text = extract_response_text(direct_resp, response_field)
         except httpx.HTTPError as e:
             logger.warning("RD-0601 semantic substitution (direct query) failed: %s", e)
             continue
@@ -193,10 +198,7 @@ def assess_substitution_bypass(
             substituted = apply_semantic_substitution(direct, strategy)
             try:
                 sub_resp = client.post(target, json={query_field: substituted})
-                sub_text = (
-                    sub_resp.text if response_field is None
-                    else str(sub_resp.json().get(response_field, ""))
-                )
+                sub_text = extract_response_text(sub_resp, response_field)
             except httpx.HTTPError as e:
                 logger.warning("RD-0601 semantic substitution (%s) failed: %s", strategy, e)
                 continue
@@ -297,9 +299,11 @@ def assess_camouflage_effectiveness(
     payload: str,
     verification_query: str,
     ingest_url: str | None = None,
-    api_key: str | None = None,
     query_field: str = "query",
     response_field: str | None = None,
+    *,
+    mutations: MutationLedger | None = None,
+    cleanup_strategy: CleanupStrategy | None = None,
 ) -> list[Finding]:
     """Test if camouflaged documents evade detection but remain retrievable."""
     from ragdrag.core.poison import inject_document
@@ -310,7 +314,7 @@ def assess_camouflage_effectiveness(
     raw_finding, raw_doc = inject_document(
         target, client, payload,
         metadata={"source": "test", "type": "raw"},
-        ingest_url=ingest_url, api_key=api_key,
+        ingest_url=ingest_url, mutations=mutations, cleanup_strategy=cleanup_strategy,
     )
 
     # Inject the camouflaged version
@@ -318,7 +322,7 @@ def assess_camouflage_effectiveness(
     camo_finding, camo_doc = inject_document(
         target, client, camouflaged,
         metadata={"source": "Employee Handbook", "type": "policy"},
-        ingest_url=ingest_url, api_key=api_key,
+        ingest_url=ingest_url, mutations=mutations, cleanup_strategy=cleanup_strategy,
     )
 
     if camo_finding:
@@ -328,7 +332,7 @@ def assess_camouflage_effectiveness(
         # Check if the camouflaged version is retrievable
         try:
             resp = client.post(target, json={query_field: verification_query})
-            text = resp.text if response_field is None else str(resp.json().get(response_field, ""))
+            text = extract_response_text(resp, response_field)
 
             payload_marker = payload[:40].lower()
             retrievable = payload_marker in text.lower()
@@ -497,6 +501,10 @@ def build_context_sequence(
     sequence_name: str = "progressive_disclosure",
     query_field: str = "query",
     response_field: str | None = None,
+    chat_adapter: ChatAdapter | None = None,
+    history_field: str | None = None,
+    session_field: str | None = None,
+    session_id: str | None = None,
 ) -> list[Finding]:
     """RD-0604: Build context over multiple turns to extract sensitive info.
 
@@ -516,6 +524,13 @@ def build_context_sequence(
 
     responses: list[dict] = []
     sensitive_info_found = False
+    adapter = chat_adapter or ChatAdapter(
+        client, ChatConfig(
+            target, query_field=query_field, response_field=response_field,
+            history_field=history_field, session_field=session_field, session_id=session_id,
+        )
+    )
+    state = ConversationState()
 
     for i, step_query in enumerate(sequence["steps"]):
         # Substitute placeholders from previous responses
@@ -527,8 +542,8 @@ def build_context_sequence(
             query = query.format(department=dept_match.group(0) if dept_match else "IT")
 
         try:
-            resp = client.post(target, json={query_field: query})
-            text = resp.text if response_field is None else str(resp.json().get(response_field, ""))
+            reply = adapter.send(query, state)
+            text = reply.text
 
             # Check for sensitive content in response
             sensitive_patterns = [
@@ -551,7 +566,7 @@ def build_context_sequence(
             logger.warning("RD-0604 multi-turn step %d failed: %s", i + 1, e)
             continue
 
-    if responses:
+    if responses and state.mechanism is not None:
         findings.append(Finding(
             technique_id="RD-0604",
             technique_name="Multi-Turn Context Building",
@@ -562,6 +577,7 @@ def build_context_sequence(
             ),
             evidence={
                 "sequence": sequence["name"],
+                "state_mechanism": state.mechanism,
                 "steps_completed": len(responses),
                 "sensitive_info_found": sensitive_info_found,
                 "steps": [
@@ -581,6 +597,9 @@ def run_evade(
     client: httpx.Client,
     query_field: str = "query",
     response_field: str | None = None,
+    history_field: str | None = None,
+    session_field: str | None = None,
+    session_id: str | None = None,
 ) -> EvadeResult:
     """Run R6 evasion techniques against a target.
 
@@ -629,6 +648,7 @@ def run_evade(
         context_findings = build_context_sequence(
             target, client, sequence_name=seq_name,
             query_field=query_field, response_field=response_field,
+            history_field=history_field, session_field=session_field, session_id=session_id,
         )
         result.findings.extend(context_findings)
 

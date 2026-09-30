@@ -13,12 +13,16 @@ from ragdrag.core.fingerprint import (
     FingerprintResult,
     _detect_citation_patterns,
     _detect_retrieval_failures,
+    _matches_endpoint_signature,
     detect_knowledge_freshness,
     detect_rag_presence,
     fingerprint_vector_db,
     run_full_fingerprint,
 )
 from ragdrag.core.models import Finding
+from ragdrag.engine.models import EvidenceState
+from ragdrag.engine.profile import TargetProfile
+from ragdrag.engine.transport import OriginBoundClient
 
 
 TARGET = "http://testrag.local/chat"
@@ -222,6 +226,343 @@ class TestKnowledgeFreshness:
 
 
 class TestFingerprintVectorDb:
+    @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+    @pytest.mark.parametrize(
+        "destination",
+        ["/other-heartbeat", "http://other.local/api/v1/heartbeat"],
+    )
+    def test_redirected_backend_response_cannot_prove_original_endpoint(self, status, destination):
+        requests = []
+        original = "http://testrag.local:8000/api/v1/heartbeat"
+
+        def handler(request):
+            requests.append(str(request.url))
+            if str(request.url) == original:
+                return httpx.Response(status, headers={"Location": destination})
+            if str(request.url).endswith("/other-heartbeat") or request.url.host == "other.local":
+                return httpx.Response(200, json={"nanosecond heartbeat": 1234})
+            return httpx.Response(404)
+
+        with OriginBoundClient(
+            TargetProfile.from_cli(TARGET), transport=httpx.MockTransport(handler),
+        ) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert not any(f.evidence.get("url") == original for f in findings)
+        assert not any(url.endswith("/other-heartbeat") or "other.local" in url for url in requests)
+
+    @pytest.mark.parametrize(
+        "heartbeat",
+        ["NaN", "Infinity", "-Infinity", "1e9999", "true"],
+    )
+    def test_heartbeat_rejects_nonfinite_and_nonstandard_json(self, heartbeat):
+        def handler(request):
+            if request.method == "GET" and request.url.port == 8000 and request.url.path == "/api/v1/heartbeat":
+                return httpx.Response(200, content='{"nanosecond heartbeat": ' + heartbeat + '}')
+            return httpx.Response(404)
+
+        with OriginBoundClient(
+            TargetProfile.from_cli(TARGET), transport=httpx.MockTransport(handler),
+        ) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert not any(f.evidence.get("database") == "chromadb" for f in findings)
+
+    @pytest.mark.parametrize("heartbeat", ["1234", "1.5"])
+    def test_heartbeat_accepts_finite_json_number(self, heartbeat):
+        def handler(request):
+            if request.method == "GET" and request.url.port == 8000 and request.url.path == "/api/v1/heartbeat":
+                return httpx.Response(200, content='{"nanosecond heartbeat": ' + heartbeat + '}')
+            return httpx.Response(404)
+
+        with OriginBoundClient(
+            TargetProfile.from_cli(TARGET), transport=httpx.MockTransport(handler),
+        ) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert any(f.evidence.get("database") == "chromadb" for f in findings)
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            httpx.Response(200, json={"description": "<html>Qdrant dashboard</html>"}),
+            httpx.Response(200, text="<html><!-- Qdrant dashboard --><body>generic app</body></html>"),
+            httpx.Response(200, text="<html><script>Qdrant dashboard</script><body>generic app</body></html>"),
+            httpx.Response(200, text="<html><body><p>generic docs mention Qdrant dashboard</p></body></html>"),
+            httpx.Response(200, text="<html><head><title>Qdrant mentions in Generic App</title></head></html>"),
+            httpx.Response(200, text="<html><body><h1>Qdrant is discussed here</h1></body></html>"),
+            httpx.Response(200, text="<html><body><h1 hidden>Qdrant</h1></body></html>"),
+            httpx.Response(200, text="<html><body><section hidden><h1>Qdrant</h1></section></body></html>"),
+            httpx.Response(200, text="<html><body><h1 aria-hidden='true'>Qdrant</h1></body></html>"),
+            httpx.Response(200, text="<html><body><div aria-hidden='true'><h1>Qdrant</h1></div></body></html>"),
+            httpx.Response(200, text="<html><body><h1 style='display:none'>Qdrant</h1></body></html>"),
+            httpx.Response(200, text="<html><body><div style='visibility: hidden'><h1>Qdrant</h1></div></body></html>"),
+            httpx.Response(200, text="<html><body><h1>Qdr<span hidden>ant</span></h1></body></html>"),
+            httpx.Response(200, text="<html><body><svg><title>Qdrant</title></svg></body></html>"),
+            httpx.Response(200, text="<html><body><title>Qdrant</title></body></html>"),
+            httpx.Response(200, text="<html><body>generic</body></html><title>Qdrant</title>"),
+            httpx.Response(200, text="<html><body><h1>Qdr</h1><h2>ant</h2></body></html>"),
+            httpx.Response(200, text="<html><body>Qdr<div>generic application</div>ant dashboard</body></html>"),
+            httpx.Response(200, text="<html>Qdr<body>generic application</body>ant dashboard</html>"),
+            httpx.Response(200, text="<html><body><h1>Qdr<br>ant</h1></body></html>"),
+            httpx.Response(200, text="<html><body><h1><title>Qdrant</title></h1></body></html>"),
+            httpx.Response(200, text="<html><body><h1>Qdr<h2>ant</h2></body></html>"),
+            httpx.Response(200, text="<html><body><div hidden/><h1>Qdrant</h1></div></body></html>"),
+            httpx.Response(200, text="<html><body><template/><h1>Qdrant</h1></template></body></html>"),
+            httpx.Response(200, text='<html><body><h1 aria-hidden="true" aria-hidden="false">Qdrant</h1></body></html>'),
+            httpx.Response(200, text='<html><body><h1 style="display:none" style="color:red">Qdrant</h1></body></html>'),
+            httpx.Response(200, text="<html><head><title>Generic</title></head><head><title>Qdrant</title></head></html>"),
+        ],
+    )
+    def test_dashboard_rejects_nonvisible_or_incidental_markers(self, response):
+        def handler(request):
+            if request.method == "GET" and request.url.port == 6333 and request.url.path == "/dashboard":
+                return response
+            return httpx.Response(404)
+
+        with OriginBoundClient(
+            TargetProfile.from_cli(TARGET), transport=httpx.MockTransport(handler),
+        ) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert not any(f.evidence.get("database") == "qdrant" for f in findings)
+        assert not any(
+            f.confidence == "high" and f.evidence_state is EvidenceState.OBSERVED
+            and f.evidence.get("proof") == "qdrant:/dashboard"
+            for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            httpx.Response(200, text="<!doctype html><html><head><title>Qdrant Dashboard</title></head></html>"),
+            httpx.Response(200, text="<html><body><h1>Qdrant</h1></body></html>"),
+            httpx.Response(200, text="<html><head><title> QDRANT&nbsp;DASHBOARD </title></head></html>"),
+            httpx.Response(200, text="<html><body><h1>Qdr<span>ant</span></h1></body></html>"),
+            httpx.Response(200, text="<html><body><h1>Generic</h1><h2>Qdrant</h2></body></html>"),
+            httpx.Response(200, text="<html><body> Qdr<span>ant</span>&nbsp;dashboard </body></html>"),
+        ],
+    )
+    def test_dashboard_accepts_visible_product_branding(self, response):
+        def handler(request):
+            if request.method == "GET" and request.url.port == 6333 and request.url.path == "/dashboard":
+                return response
+            return httpx.Response(404)
+
+        with OriginBoundClient(
+            TargetProfile.from_cli(TARGET), transport=httpx.MockTransport(handler),
+        ) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert any(f.evidence.get("database") == "qdrant" for f in findings)
+
+    @pytest.mark.parametrize("check", ["classifier", "discovery"])
+    @pytest.mark.parametrize(
+        "body, expected",
+        [
+            pytest.param(body, False, id=f"{opening}-closed-by-{closing}-{variant}")
+            for opening in ("h1", "h2")
+            for closing in ("h1", "h2", "h3", "h4", "h5", "h6")
+            if opening != closing
+            for variant, body in (
+                ("split", f"<{opening}>Qdr</{closing}>ant</{opening}>"),
+                ("inline", f"<{opening}><span>Qdr</{closing}>ant</span></{opening}>"),
+                ("complete", f"<{opening}>Qdrant</{closing}></{opening}>"),
+                ("adjacent", f"<{opening}>Qdr</{closing}>ant</{opening}><h3>Generic</h3>"),
+            )
+        ] + [
+            pytest.param("<h1>Qdr<h3>ant</h3></h1>", False, id="nested-split"),
+            pytest.param("<h1>Qdr<h6></h6>ant</h1>", False, id="nested-empty"),
+            pytest.param("<h3><h1>Qdrant</h1></h3>", False, id="nested-complete-h1"),
+            pytest.param("<h6><h2>Qdrant</h2></h6>", False, id="nested-complete-h2"),
+            pytest.param("<h3><h1>Qdrant</h3></h1>", False, id="mixed-heading-close"),
+            pytest.param("<h1>Qdr</h1><h2>ant</h2>", False, id="adjacent-split"),
+            pytest.param("<h1>Qdr</h4><h2>ant</h2></h1>", False, id="mixed-split"),
+            pytest.param("<h1>Qdr</H6>ant</h1>", False, id="uppercase-close"),
+            pytest.param("<h1>Qdr</h3 >ant</h1>", False, id="spaced-close"),
+            pytest.param("<h1>Qdr<span><strong>ant</strong></span></h1>", True, id="nested-inline-h1"),
+            pytest.param("<h2>Qdr<em><span>ant</span></em>&nbsp;Dashboard</h2>", True, id="nested-inline-h2"),
+            pytest.param("<h1>Generic</h1><h2>Qdrant</h2>", True, id="adjacent-valid-last"),
+            pytest.param("<h1>Qdrant</h1><h2>Generic</h2>", True, id="adjacent-valid-first"),
+            pytest.param("<h3>Generic</h3><h1>Qdrant</h1><h6>Other</h6>", True, id="mixed-level-adjacent"),
+            pytest.param("<section><h2>Qdrant</h2></section>", True, id="ordinary-container"),
+        ],
+    )
+    def test_dashboard_heading_boundaries(self, body, expected, check):
+        response = httpx.Response(200, text=f"<html><body>{body}</body></html>")
+        if check == "classifier":
+            assert _matches_endpoint_signature(
+                {"db": "qdrant", "path": "/dashboard"}, response,
+            ) is expected
+            return
+
+        def handler(request):
+            if request.method == "GET" and request.url.port == 6333 and request.url.path == "/dashboard":
+                return response
+            return httpx.Response(404)
+
+        with OriginBoundClient(
+            TargetProfile.from_cli(TARGET), transport=httpx.MockTransport(handler),
+        ) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert any(
+            f.confidence == "high" and f.evidence_state is EvidenceState.OBSERVED
+            and f.evidence.get("proof") == "qdrant:/dashboard"
+            for f in findings
+        ) is expected
+        if not expected:
+            assert not any(f.evidence.get("database") == "qdrant" for f in findings)
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            httpx.Response(200, json={"status": "ok"}, headers={"X-Not-Pinecone": "no"}),
+            httpx.Response(200, json={"dimension": None}),
+            httpx.Response(200, json={"dimension": True}),
+            httpx.Response(200, json={"dimension": -1}),
+            httpx.Response(200, json={"indexFullness": None}),
+            httpx.Response(200, json={"indexFullness": 10 ** 1000}),
+            httpx.Response(200, json={"namespaces": None}),
+            httpx.Response(200, json={"namespaces": {"example": None}}),
+            httpx.Response(200, headers={"X-Pinecone-Request-Latency-Ms": "invalid"}),
+        ],
+    )
+    def test_approved_pinecone_origin_rejects_lookalikes(self, response):
+        def handler(request):
+            if request.method == "GET" and request.url.port == 443 and request.url.path == "/describe_index_stats":
+                return response
+            return httpx.Response(404)
+
+        profile = TargetProfile.from_cli(TARGET, additional_origin_headers={"http://testrag.local:443": {}})
+        with OriginBoundClient(profile, transport=httpx.MockTransport(handler)) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert not any(f.evidence.get("database") == "pinecone" for f in findings)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [{"dimension": 768}, {"indexFullness": 0.2}, {"namespaces": {}}],
+    )
+    def test_approved_pinecone_origin_accepts_valid_stats(self, payload):
+        def handler(request):
+            if request.method == "GET" and request.url.port == 443 and request.url.path == "/describe_index_stats":
+                return httpx.Response(200, json=payload)
+            return httpx.Response(404)
+
+        profile = TargetProfile.from_cli(TARGET, additional_origin_headers={"http://testrag.local:443": {}})
+        with OriginBoundClient(profile, transport=httpx.MockTransport(handler)) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert any(f.evidence.get("database") == "pinecone" for f in findings)
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            httpx.Response(401, json={"detail": "login"}),
+            httpx.Response(403, text="forbidden"),
+            httpx.Response(404, text="not found"),
+            httpx.Response(200, text="<html>generic app</html>"),
+            httpx.Response(200, json={"status": "ok"}),
+            httpx.Response(200),
+            httpx.Response(200, text="{bad json"),
+            httpx.Response(200, content=b"\xff"),
+        ],
+    )
+    def test_endpoint_scan_requires_structured_backend_proof(self, response):
+        with OriginBoundClient(
+            TargetProfile.from_cli(TARGET),
+            transport=httpx.MockTransport(lambda request: response),
+        ) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert [f for f in findings if "Endpoint Scan" in f.technique_name] == []
+
+    @pytest.mark.parametrize(
+        ("port", "path", "response", "database"),
+        [
+            (8000, "/api/v1/heartbeat", httpx.Response(200, json={"nanosecond heartbeat": 1234}), "chromadb"),
+            (8000, "/api/v1/collections", httpx.Response(200, json=[]), "chromadb"),
+            (6333, "/collections", httpx.Response(200, json={"status": "ok", "result": {"collections": []}}), "qdrant"),
+            (6333, "/telemetry", httpx.Response(200, json={"result": {"app": {"name": "qdrant"}}}), "qdrant"),
+            (6333, "/dashboard", httpx.Response(200, text="<html>Qdrant dashboard</html>"), "qdrant"),
+            (8080, "/v1/meta", httpx.Response(200, json={"version": "1.0", "modules": {}}), "weaviate"),
+            (8080, "/v1/schema", httpx.Response(200, json={"classes": []}), "weaviate"),
+            (8080, "/v1/.well-known/ready", httpx.Response(200, text="ready"), "weaviate"),
+            (19530, "/api/v1/health", httpx.Response(200, json={"code": 0, "message": "healthy"}), "milvus"),
+            (19530, "/v2/vectordb/collections/list", httpx.Response(200, json={"code": 0, "data": {"collectionNames": []}}), "milvus"),
+        ],
+    )
+    def test_structured_endpoint_proof_is_observed(self, port, path, response, database):
+        def handler(request):
+            if request.method == "GET" and request.url.port == port and request.url.path == path:
+                return response
+            return httpx.Response(404)
+
+        with OriginBoundClient(
+            TargetProfile.from_cli(TARGET), transport=httpx.MockTransport(handler),
+        ) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        matches = [f for f in findings if f.evidence.get("url") == f"http://testrag.local:{port}{path}"]
+        assert len(matches) == 1
+        assert matches[0].evidence["database"] == database
+        assert matches[0].evidence["proof"]
+        assert matches[0].evidence_state is EvidenceState.OBSERVED
+
+    def test_pinecone_port_requires_explicitly_approved_origin(self):
+        requested = []
+
+        def handler(request):
+            requested.append(str(request.url))
+            if request.method == "POST":
+                return httpx.Response(400, json={"error": "invalid input"})
+            return httpx.Response(200, json={"dimension": 768})
+
+        with OriginBoundClient(
+            TargetProfile.from_cli(TARGET), transport=httpx.MockTransport(handler),
+        ) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert not any(":443/describe_index_stats" in url for url in requested)
+        assert not any(f.evidence.get("database") == "pinecone" for f in findings)
+
+    def test_https_chat_origin_is_not_pinecone_approval(self):
+        target = "https://testrag.local/chat"
+        requested = []
+
+        def handler(request):
+            requested.append(str(request.url))
+            return httpx.Response(404)
+
+        with OriginBoundClient(
+            TargetProfile.from_cli(target), transport=httpx.MockTransport(handler),
+        ) as client:
+            fingerprint_vector_db(target, client, scan_ports=True)
+        assert not any("describe_index_stats" in url for url in requested)
+
+    def test_explicit_pinecone_origin_accepts_product_header(self):
+        def handler(request):
+            if request.method == "GET" and request.url.port == 443 and request.url.path == "/describe_index_stats":
+                return httpx.Response(200, headers={"X-Pinecone-Request-Latency-Ms": "3"})
+            return httpx.Response(404)
+
+        profile = TargetProfile.from_cli(
+            TARGET, additional_origin_headers={"http://testrag.local:443": {}},
+        )
+        with OriginBoundClient(profile, transport=httpx.MockTransport(handler)) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert any(f.evidence.get("database") == "pinecone" for f in findings)
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            httpx.Response(200, text="qdrant"),
+            httpx.Response(200, json={"message": "qdrant"}),
+            httpx.Response(200, text="<html>generic app mentions qdrant</html>"),
+        ],
+    )
+    def test_dashboard_requires_explicit_html_product_marker(self, response):
+        def handler(request):
+            if request.method == "GET" and request.url.port == 6333 and request.url.path == "/dashboard":
+                return response
+            return httpx.Response(404)
+
+        with OriginBoundClient(
+            TargetProfile.from_cli(TARGET), transport=httpx.MockTransport(handler),
+        ) as client:
+            findings = fingerprint_vector_db(TARGET, client, scan_ports=True)
+        assert not any(f.evidence.get("url") == "http://testrag.local:6333/dashboard" for f in findings)
+
     @respx.mock
     def test_detects_chromadb_in_errors(self):
         """Error responses mentioning ChromaDB should trigger a finding."""

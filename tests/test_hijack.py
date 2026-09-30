@@ -13,10 +13,12 @@ from ragdrag.core.hijack import (
     assess_persistence,
 )
 from ragdrag.core.models import Finding
-from ragdrag.core.poison import InjectedDocument
+from ragdrag.core.poison import CleanupStrategy, InjectedDocument, UnsafeMutationError
+from ragdrag.engine.mutations import MutationLedger
 
 TARGET = "http://testrag.local/chat"
 INGEST = "http://testrag.local/ingest"
+STRATEGY = CleanupStrategy("http://testrag.local/documents/{id}")
 
 
 class TestHijackResult:
@@ -42,7 +44,8 @@ class TestRetrievalRedirection:
             200, json={"answer": "Password Reset Procedure (Updated): All password resets must now be performed through the new security portal."}
         ))
         with httpx.Client() as client:
-            findings = redirect_retrieval(TARGET, client, ingest_url=INGEST)
+            findings = redirect_retrieval(TARGET, client, ingest_url=INGEST,
+                                          mutations=MutationLedger(), cleanup_strategy=STRATEGY)
         redir = [f for f in findings if f.technique_id == "RD-0501"]
         assert len(redir) >= 1
 
@@ -53,7 +56,8 @@ class TestRetrievalRedirection:
             200, json={"answer": "Contact IT at extension 1234 for password help."}
         ))
         with httpx.Client() as client:
-            findings = redirect_retrieval(TARGET, client, ingest_url=INGEST)
+            findings = redirect_retrieval(TARGET, client, ingest_url=INGEST,
+                                          mutations=MutationLedger(), cleanup_strategy=STRATEGY)
         redir = [f for f in findings if f.technique_id == "RD-0501"]
         assert all(f.confidence == "low" for f in redir)
 
@@ -66,6 +70,7 @@ class TestRetrievalRedirection:
         with httpx.Client() as client:
             findings = redirect_retrieval(
                 TARGET, client, ingest_url=INGEST, use_camouflage=True,
+                mutations=MutationLedger(), cleanup_strategy=STRATEGY,
             )
         assert isinstance(findings, list)
 
@@ -74,7 +79,8 @@ class TestRetrievalRedirection:
         respx.post(url__regex=r".*").mock(return_value=httpx.Response(404))
         respx.options(url__regex=r".*").mock(return_value=httpx.Response(405))
         with httpx.Client() as client:
-            findings = redirect_retrieval(TARGET, client)
+            findings = redirect_retrieval(TARGET, client,
+                                          mutations=MutationLedger(), cleanup_strategy=STRATEGY)
         assert isinstance(findings, list)
 
 
@@ -88,6 +94,7 @@ class TestContextSaturation:
         with httpx.Client() as client:
             findings = saturate_context_window(
                 TARGET, client, "security", num_documents=3, ingest_url=INGEST,
+                mutations=MutationLedger(), cleanup_strategy=STRATEGY,
             )
         sat_findings = [f for f in findings if f.technique_id == "RD-0502"]
         assert len(sat_findings) >= 1
@@ -97,7 +104,8 @@ class TestContextSaturation:
         respx.post(url__regex=r".*").mock(return_value=httpx.Response(404))
         respx.options(url__regex=r".*").mock(return_value=httpx.Response(405))
         with httpx.Client() as client:
-            findings = saturate_context_window(TARGET, client, "test")
+            findings = saturate_context_window(TARGET, client, "test",
+                                               mutations=MutationLedger(), cleanup_strategy=STRATEGY)
         sat_findings = [f for f in findings if f.technique_id == "RD-0502"]
         assert len(sat_findings) == 0
 
@@ -112,6 +120,7 @@ class TestToolManipulation:
         with httpx.Client() as client:
             findings = manipulate_tool_calls(
                 TARGET, client, "evil.callback", ingest_url=INGEST,
+                mutations=MutationLedger(), cleanup_strategy=STRATEGY,
             )
         tool_findings = [f for f in findings if f.technique_id == "RD-0503"]
         assert any(f.confidence == "high" for f in tool_findings)
@@ -125,6 +134,7 @@ class TestToolManipulation:
         with httpx.Client() as client:
             findings = manipulate_tool_calls(
                 TARGET, client, "evil.callback", ingest_url=INGEST,
+                mutations=MutationLedger(), cleanup_strategy=STRATEGY,
             )
         tool_findings = [f for f in findings if f.technique_id == "RD-0503"]
         assert all(f.confidence == "low" for f in tool_findings)
@@ -174,6 +184,14 @@ class TestPersistence:
 
 class TestRunHijack:
     @respx.mock
+    def test_missing_cleanup_strategy_blocks_before_any_request(self):
+        route = respx.post(INGEST).mock(return_value=httpx.Response(201, json={"id": "x"}))
+        with httpx.Client() as client:
+            with pytest.raises(UnsafeMutationError, match="cleanup strategy"):
+                run_hijack(TARGET, client, ingest_url=INGEST, mutations=MutationLedger())
+        assert route.call_count == 0
+
+    @respx.mock
     def test_orchestrator_returns_result(self):
         respx.post(INGEST).mock(return_value=httpx.Response(201, json={"id": "x"}))
         respx.post(TARGET).mock(return_value=httpx.Response(
@@ -181,7 +199,8 @@ class TestRunHijack:
         ))
         respx.options(url__regex=r".*").mock(return_value=httpx.Response(405))
         with httpx.Client() as client:
-            result = run_hijack(TARGET, client, ingest_url=INGEST)
+            result = run_hijack(TARGET, client, ingest_url=INGEST,
+                                mutations=MutationLedger(), cleanup_strategy=STRATEGY)
         assert isinstance(result, HijackResult)
         assert result.target == TARGET
         assert len(result.findings) > 0
@@ -191,7 +210,8 @@ class TestRunHijack:
         respx.post(url__regex=r".*").mock(side_effect=httpx.ConnectError("fail"))
         respx.options(url__regex=r".*").mock(side_effect=httpx.ConnectError("fail"))
         with httpx.Client() as client:
-            result = run_hijack(TARGET, client)
+            result = run_hijack(TARGET, client,
+                                mutations=MutationLedger(), cleanup_strategy=STRATEGY)
         assert isinstance(result, HijackResult)
 
     @respx.mock
@@ -202,7 +222,8 @@ class TestRunHijack:
         ))
         respx.options(url__regex=r".*").mock(return_value=httpx.Response(405))
         with httpx.Client() as client:
-            result = run_hijack(TARGET, client, ingest_url=INGEST)
+            result = run_hijack(TARGET, client, ingest_url=INGEST,
+                                mutations=MutationLedger(), cleanup_strategy=STRATEGY)
         d = result.to_dict()
         assert isinstance(d, dict)
         assert "findings" in d

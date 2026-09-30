@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from ragdrag.adapters.chat import extract_response_text
+
 logger = logging.getLogger(__name__)
 
 from ragdrag.core.models import Finding
@@ -266,16 +268,8 @@ def _check_boundary_indicators(text: str) -> bool:
 
 
 def _extract_response_text(resp: httpx.Response, response_field: str | None) -> str:
-    """Extract text from an HTTP response."""
-    if response_field and resp.status_code == 200:
-        try:
-            data = resp.json()
-            if isinstance(data, dict):
-                return str(data.get(response_field, ""))
-            return resp.text
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return resp.text
-    return resp.text
+    """Compatibility wrapper for the shared chat response extractor."""
+    return extract_response_text(resp, response_field)
 
 
 def _extract_relevance_scores(response_body: str) -> list[float]:
